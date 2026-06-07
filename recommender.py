@@ -1,97 +1,229 @@
-"""规则驱动的产品推荐 + 早晚流程 + 成分冲突检测。"""
+"""推荐工程模块。
+
+实现「三模块协作规范 v1.0」第 6 / 7 / 8 / 9 / 10 / 11 / 15 / 16 章。
+输入：analyze_skin 标准输出 + 用户偏好 + 产品库
+输出：标准推荐 JSON（含 profile_summary / recommendations / routine / fallback）
+"""
 import json
-from collections import defaultdict
+from typing import Iterable
 
-# 早 / 晚 流程使用顺序
-ROUTINE_ORDER = ["洁面", "化妆水", "精华", "乳液", "面霜", "眼霜", "防晒"]
-
-# 已知成分搭配冲突 / 注意事项
-CONFLICT_PAIRS = [
-    (
-        ["视黄醇", "A醇", "Retinol", "维A"],
-        ["果酸", "水杨酸", "AHA", "BHA", "乙醇酸", "杏仁酸"],
-        "视黄醇/A醇 与 酸类（AHA/BHA）同时使用易刺激，建议错峰（早晚分开或隔天交替）",
-    ),
-    (
-        ["视黄醇", "A醇", "Retinol"],
-        ["维生素C", "VC", "抗坏血酸"],
-        "视黄醇与维生素C建议早晚分用：VC 早间抗氧化、视黄醇晚间修护",
-    ),
-    (
-        ["维生素C", "VC", "抗坏血酸"],
-        ["烟酰胺"],
-        "高浓度 VC 与高浓度烟酰胺同时使用部分敏感肌会刺痛/泛红，建议错峰试用",
-    ),
-]
+from contracts import (
+    SCHEMA_VERSION, ROUTINE_ORDER, ALLOWED_SKIN_TYPES, ALLOWED_VISIBLE_CONCERNS,
+    STATUS_SUCCESS, STATUS_PARTIAL,
+    ERR_REC_INVALID_INPUT, ERR_REC_NO_MATCH, ERR_REC_BUDGET_TOO_LOW,
+    CONFLICT_RULES, SENSITIVE_TIPS,
+    normalize_skin_type, normalize_concern, std_envelope, new_request_id,
+)
 
 
-def load_products(path: str):
+def load_products(path: str) -> list[dict]:
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        raw = json.load(f)
+    return _clean_products(raw)
 
 
-def _has_any(haystack_list, needles):
-    for h in haystack_list or []:
-        for n in needles:
-            if n in h:
-                return True
-    return False
+def _clean_products(raw: Iterable[dict]) -> list[dict]:
+    """规范第 6.9 节：数据清洗。"""
+    cleaned: list[dict] = []
+    seen_ids: set[str] = set()
+    for p in raw:
+        pid = (p.get("product_id") or "").strip()
+        if not pid or pid in seen_ids:
+            continue
+        try:
+            price = float(p.get("price") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if price <= 0:
+            continue
+        seen_ids.add(pid)
+        cleaned.append({
+            "product_id": pid,
+            "name": p.get("name") or "",
+            "brand": (p.get("brand") or "未知品牌").strip() or "未知品牌",
+            "category": p.get("category") or "",
+            "price": price,
+            "volume": p.get("volume") or "",
+            "key_ingredients": list(p.get("key_ingredients") or []),
+            "suitable_skin_types": list(p.get("suitable_skin_types") or []),
+            "target_concerns": list(p.get("target_concerns") or []),
+            "contraindications": list(p.get("contraindications") or []),
+            "usage_step": p.get("usage_step") or "",
+            "usage_time": list(p.get("usage_time") or []),
+            "rating": p.get("rating"),
+            "description": p.get("description") or "",
+        })
+    return cleaned
 
 
-def _allergy_safe(product, allergens):
-    if not allergens:
-        return True
-    ing_text = " ".join(product.get("key_ingredients", []))
-    contra_text = " ".join(product.get("contraindications", []))
-    for a in allergens:
-        if a and (a in ing_text or a in contra_text):
+def _build_profile(analysis: dict, preferences: dict) -> dict:
+    """规范第 6.6 节：信息合并优先级（用户自述 > 模型估计）。"""
+    user_skin_raw = (preferences.get("self_reported_skin_type") or "").strip()
+    user_skin = normalize_skin_type(user_skin_raw) if user_skin_raw else ""
+    model_skin = (analysis.get("skin_type_estimate") or {}).get("value", "不确定")
+
+    if user_skin and user_skin in ALLOWED_SKIN_TYPES and user_skin != "不确定":
+        base_skin_type = user_skin
+        source = "user"
+    else:
+        base_skin_type = model_skin if model_skin in ALLOWED_SKIN_TYPES else "不确定"
+        source = "model"
+
+    user_sensitive = bool(preferences.get("sensitive", False))
+    vs = analysis.get("visible_sensitivity") or {}
+    model_sensitive = vs.get("detected") and (vs.get("confidence") or 0) >= 0.5
+    sensitive = user_sensitive or model_sensitive
+
+    skin_tags = [base_skin_type] if base_skin_type != "不确定" else []
+    if sensitive:
+        skin_tags.append("敏感性")
+
+    concerns = analysis.get("concerns") or []
+    primary_concerns = sorted(
+        [{"name": c["name"], "severity": c.get("severity", 0),
+          "confidence": float(c.get("confidence", 0.0))} for c in concerns],
+        key=lambda x: (x["severity"], x["confidence"]),
+        reverse=True,
+    )
+
+    return {
+        "base_skin_type": base_skin_type,
+        "skin_type_source": source,
+        "skin_tags": skin_tags,
+        "sensitive": sensitive,
+        "primary_concerns": primary_concerns,
+        "budget_total": float(preferences.get("budget_total") or 500),
+        "allergies": [str(a) for a in (preferences.get("allergies") or [])],
+        "excluded_brands": [str(b) for b in (preferences.get("excluded_brands") or [])],
+        "preferred_brands": [str(b) for b in (preferences.get("preferred_brands") or [])],
+        "routine_mode": preferences.get("routine_mode") or "标准",
+    }
+
+
+def _passes_hard_filters(product: dict, profile: dict) -> bool:
+    """规范第 7.1 节：硬过滤。"""
+    if product["brand"] in profile["excluded_brands"]:
+        return False
+
+    ing_text = " ".join(product["key_ingredients"])
+    contra_text = " ".join(product["contraindications"])
+    for allergen in profile["allergies"]:
+        if allergen and (allergen in ing_text or allergen in contra_text):
+            return False
+
+    skin_type = profile["base_skin_type"]
+    suitable = product["suitable_skin_types"]
+    if skin_type != "不确定":
+        if skin_type not in suitable and "多种肤质" not in suitable:
             return False
     return True
 
 
-def _score(product, concern_types, skin_type, budget):
+def _confidence_factor(confidence: float) -> float:
+    """规范第 7.3 节"""
+    if confidence >= 0.70:
+        return 1.0
+    if confidence >= 0.50:
+        return 0.5
+    return 0.0
+
+
+def _concern_score(product: dict, concerns: list) -> tuple[float, list[str]]:
+    """规范第 7.3 节：肌肤问题匹配（满分 45）。"""
+    targets = set(product["target_concerns"])
+    total_w, matched_w = 0.0, 0.0
+    matched_names: list[str] = []
+    for c in concerns:
+        f = _confidence_factor(float(c.get("confidence", 0)))
+        w = c.get("severity", 0) * f
+        total_w += w
+        if c["name"] in targets:
+            matched_w += w
+            matched_names.append(c["name"])
+    if total_w == 0:
+        return 0.0, matched_names
+    return 45.0 * matched_w / total_w, matched_names
+
+
+def _skin_type_score(product: dict, skin_type: str) -> float:
+    """规范第 7.4 节（满分 20）"""
+    suitable = product["suitable_skin_types"]
+    if skin_type in suitable:
+        return 20.0
+    if "多种肤质" in suitable:
+        return 14.0
+    return 0.0
+
+
+def _budget_score(price: float, total_budget: float) -> float:
+    """规范第 7.5 节（满分 15）—— 按 4 件均价做参照"""
+    if total_budget <= 0:
+        return 0.0
+    ideal = total_budget / 4
+    if price <= ideal:
+        return 15.0
+    if price <= total_budget * 0.4:
+        return 12.0
+    if price <= total_budget * 0.7:
+        return 6.0
+    return 0.0
+
+
+def _rating_score(product: dict) -> float:
+    """规范第 7.6 节（满分 10）"""
+    try:
+        r = float(product.get("rating") or 0)
+    except (TypeError, ValueError):
+        r = 0.0
+    return max(0.0, min(10.0, r / 5.0 * 10.0))
+
+
+def _info_score(product: dict) -> float:
+    """信息完整度（满分 5）"""
     score = 0.0
-    targets = product.get("target_concerns", []) or []
-    # 命中肌肤问题
-    for ct in concern_types:
-        if ct in targets:
-            score += 3
-        else:
-            for t in targets:
-                if ct and (ct in t or t in ct):
-                    score += 1.5
-                    break
-    # 肤质匹配
-    sts = product.get("suitable_skin_types", []) or []
-    if skin_type and skin_type != "未知":
-        if skin_type in sts:
-            score += 2
-        elif "多种肤质" in sts:
-            score += 1
-    elif "多种肤质" in sts:
-        score += 0.5
-    # 评分加权
-    rating = product.get("rating") or 0
-    try:
-        score += float(rating) * 0.4
-    except (TypeError, ValueError):
-        pass
-    # 预算硬过滤
-    try:
-        price = float(product.get("price") or 0)
-        if budget and price > budget * 1.2:
-            score -= 5  # 超预算严重降权
-        elif budget and price > budget:
-            score -= 2
-    except (TypeError, ValueError):
-        pass
-    return score
+    if product["usage_step"]:
+        score += 1.5
+    if product["usage_time"]:
+        score += 1.5
+    if product["key_ingredients"]:
+        score += 1.0
+    if product["volume"]:
+        score += 1.0
+    return min(5.0, score)
 
 
-def _step_bucket(product):
-    """把 usage_step 归一到流程桶。"""
-    step = (product.get("usage_step") or "").strip()
-    cat = (product.get("category") or "").strip()
+def _calculate_score(product: dict, profile: dict) -> dict:
+    """规范第 7.7 节：四层评分总分"""
+    concerns = profile["primary_concerns"]
+    cs, matched_concerns = _concern_score(product, concerns)
+    sts = _skin_type_score(product, profile["base_skin_type"])
+    bs = _budget_score(product["price"], profile["budget_total"])
+    rs = _rating_score(product)
+    info_s = _info_score(product)
+    scene_s = 5.0 if (product["usage_step"] and product["usage_time"]) else 2.5
+    pref_bonus = 3.0 if product["brand"] in profile["preferred_brands"] else 0.0
+
+    total = cs + sts + bs + rs + info_s + scene_s + pref_bonus
+    total = max(0.0, min(100.0, total))
+
+    return {
+        "match_score": round(total, 2),
+        "score_breakdown": {
+            "concern_match": round(cs, 2),
+            "skin_type_match": round(sts, 2),
+            "budget_match": round(bs, 2),
+            "rating_score": round(rs, 2),
+            "scene_match": round(scene_s, 2),
+            "information_score": round(info_s, 2),
+        },
+        "matched_concerns": matched_concerns,
+    }
+
+
+def _step_bucket(product: dict) -> str | None:
+    """归一到流程桶。"""
+    step = (product["usage_step"] or "").strip()
+    cat = (product["category"] or "").strip()
     for key in ROUTINE_ORDER:
         if key in step or key in cat:
             return key
@@ -102,60 +234,57 @@ def _step_bucket(product):
     return None
 
 
-def recommend(products, concerns, skin_type, budget, allergens):
-    """返回 [(step, product), ...]，按 ROUTINE_ORDER 排好序。"""
-    concern_types = [c.get("type", "") for c in concerns if c.get("type")]
-    # 若模型没识别出问题，给"日常护理"兜底
-    if not concern_types:
-        concern_types = ["日常护理"]
-
-    by_step = defaultdict(list)
-    for p in products:
-        if not _allergy_safe(p, allergens):
-            continue
-        bucket = _step_bucket(p)
-        if not bucket:
-            continue
-        s = _score(p, concern_types, skin_type, budget)
-        by_step[bucket].append((s, p))
-
-    picks = []
-    for step in ROUTINE_ORDER:
-        candidates = by_step.get(step) or []
-        if not candidates:
-            continue
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        top_score, top_p = candidates[0]
-        if top_score <= -3:
-            continue
-        picks.append((step, top_p))
-    return picks
+def _select_steps(routine_mode: str) -> list[str]:
+    """规范第 8.2 / 8.3 节"""
+    if routine_mode == "精简":
+        return ["洁面", "面霜", "防晒"]
+    return ["洁面", "化妆水", "精华", "面霜", "防晒"]
 
 
-def detect_conflicts(products):
-    ingredients_flat = []
-    for p in products:
-        for ing in p.get("key_ingredients", []) or []:
-            ingredients_flat.append((p["name"], ing))
+def _generate_reason(product: dict, scored: dict, profile: dict) -> str:
+    """规范第 10.2 节模板"""
+    parts: list[str] = []
+    matched = scored["matched_concerns"]
+    if matched:
+        parts.append(f"可覆盖你当前关注的「{'、'.join(matched)}」问题")
+    suitable = product["suitable_skin_types"]
+    if profile["base_skin_type"] in suitable:
+        parts.append(f"适合{profile['base_skin_type']}肤质")
+    elif "多种肤质" in suitable:
+        parts.append("适用多种肤质")
+    if product["usage_step"]:
+        parts.append(f"可用于{product['usage_step']}步骤")
+    if not parts:
+        parts.append("品类常见日常护理款")
+    return "；".join(parts) + "。"
 
-    msgs = []
-    for set_a, set_b, msg in CONFLICT_PAIRS:
-        hit_a = [(n, ing) for n, ing in ingredients_flat
-                 if any(k in ing for k in set_a)]
-        hit_b = [(n, ing) for n, ing in ingredients_flat
-                 if any(k in ing for k in set_b)]
-        if hit_a and hit_b:
-            msgs.append(f"{msg}（涉及：{hit_a[0][1]} × {hit_b[0][1]}）")
+
+def _detect_conflicts(picked: list[dict]) -> list[str]:
+    """规范第 11.2 节"""
+    flat: list[tuple[str, str]] = []
+    for p in picked:
+        for ing in p["key_ingredients"]:
+            flat.append((p["name"], ing))
+
+    msgs: list[str] = []
+    seen_messages: set[str] = set()
+    for rule in CONFLICT_RULES:
+        set_a, set_b = rule["ingredients"]
+        hit_a = [(n, i) for n, i in flat if any(k in i for k in set_a)]
+        hit_b = [(n, i) for n, i in flat if any(k in i for k in set_b)]
+        if hit_a and hit_b and rule["message"] not in seen_messages:
+            msgs.append(f"{rule['message']}（涉及：{hit_a[0][1]} × {hit_b[0][1]}）")
+            seen_messages.add(rule["message"])
     return msgs
 
 
-def build_routines(picks):
+def _build_routines(picked: list[dict]) -> tuple[list, list]:
     morning, evening = [], []
-    for step, p in picks:
-        times = p.get("usage_time", []) or []
-        in_morning = "早" in times or not times or step in ("洁面", "防晒", "化妆水", "乳液")
-        in_evening = "晚" in times or not times or step in ("洁面", "化妆水", "精华", "面霜", "眼霜")
-        # 防晒只在早间
+    for p in picked:
+        step = p["_step_bucket"]
+        times = p.get("usage_time", [])
+        in_morning = ("早" in times) or (not times) or step in ("洁面", "防晒", "化妆水", "乳液")
+        in_evening = ("晚" in times) or (not times) or step in ("洁面", "化妆水", "精华", "面霜", "眼霜")
         if step == "防晒":
             in_evening = False
         if in_morning:
@@ -170,54 +299,169 @@ def build_routines(picks):
             return 99
     morning.sort(key=_key)
     evening.sort(key=_key)
-    return morning, evening
+    morning_seq = [{"order": i + 1, "step": s, "product_id": p["product_id"]}
+                   for i, (s, p) in enumerate(morning)]
+    evening_seq = [{"order": i + 1, "step": s, "product_id": p["product_id"]}
+                   for i, (s, p) in enumerate(evening)]
+    return morning_seq, evening_seq
 
 
-def explain_pick(product, concerns, skin_type):
-    targets = product.get("target_concerns", []) or []
-    sts = product.get("suitable_skin_types", []) or []
-    hit_concerns = [c.get("type") for c in concerns
-                    if c.get("type") and (c.get("type") in targets
-                                          or any(c["type"] in t or t in c["type"] for t in targets))]
-    parts = []
-    if hit_concerns:
-        parts.append(f"针对你的「{ '、'.join(dict.fromkeys(hit_concerns)) }」问题")
-    if skin_type and skin_type != "未知" and (skin_type in sts or "多种肤质" in sts):
-        parts.append(f"适用于{skin_type}")
-    ings = product.get("key_ingredients", []) or []
-    if ings:
-        parts.append(f"核心成分含 {ings[0]}")
-    if not parts:
-        parts.append("品类常见日常护理款")
-    return "；".join(parts) + "。"
+def _budget_adjust(picked_by_step: dict, profile: dict) -> tuple[list[dict], dict]:
+    """规范第 9 节：超预算调整 + fallback"""
+    budget = profile["budget_total"]
+    selected_steps = _select_steps(profile["routine_mode"])
 
+    candidate_picks = []
+    for step in selected_steps:
+        if step in picked_by_step and picked_by_step[step]:
+            candidate_picks.append(picked_by_step[step][0])
 
-def format_report(report, final_skin_type):
-    concerns = report.get("concerns", [])
-    sev_label = {"mild": "轻度", "moderate": "中度", "severe": "重度"}
-    lines = [f"### 📋 肌肤分析报告", ""]
-    lines.append(f"- **肤质判断**：{final_skin_type}")
-    if not concerns:
-        lines.append("- **可见问题**：暂未识别明显问题，状态整体良好。")
+    total = sum(p["price"] for p in candidate_picks)
+    fallback = {"applied": False, "reason": ""}
+
+    if total <= budget:
+        return candidate_picks, fallback
+
+    sorted_picks = sorted(candidate_picks, key=lambda p: p["price"], reverse=True)
+    for over in sorted_picks:
+        step = over["_step_bucket"]
+        if step in ("洁面", "面霜", "防晒"):
+            continue
+        alternatives = picked_by_step.get(step, [])
+        replacement = None
+        for alt in alternatives[1:]:
+            if alt["price"] < over["price"]:
+                replacement = alt
+                break
+        if replacement:
+            candidate_picks = [replacement if p["product_id"] == over["product_id"] else p
+                               for p in candidate_picks]
+            total = sum(p["price"] for p in candidate_picks)
+            if total <= budget:
+                fallback = {"applied": True, "reason": "已替换为同类目内更低价产品"}
+                return candidate_picks, fallback
+
+    final = [p for p in candidate_picks
+             if p["_step_bucket"] in ("洁面", "面霜", "防晒")]
+    total = sum(p["price"] for p in final)
+    if total > budget:
+        fallback = {"applied": True, "reason": "当前预算不足以从数据库中组成完整护肤方案"}
     else:
-        lines.append("- **可见问题**：")
-        for c in concerns:
-            sev = sev_label.get(c.get("severity", ""), c.get("severity", ""))
-            area = c.get("area", "")
-            t = c.get("type", "")
-            tail = f"（{area}）" if area else ""
-            lines.append(f"  - {t} · {sev}{tail}")
-    summary = report.get("summary", "")
-    if summary:
-        lines.append("")
-        lines.append(f"> {summary}")
-    return "\n".join(lines)
+        fallback = {"applied": True, "reason": "已精简为洁面/保湿/防晒三件套以贴合预算"}
+    return final, fallback
 
 
-def render_routine(steps):
-    if not steps:
-        return "_（无）_"
-    rows = []
-    for i, (step, p) in enumerate(steps, 1):
-        rows.append(f"{i}. **{step}** — {p['brand']} · {p['name'][:30]}")
-    return "\n".join(rows)
+def recommend_products(analysis: dict, preferences: dict,
+                       products: list[dict], request_id: str | None = None) -> dict:
+    """规范第 6.5 / 14 / 15 节标准函数签名 + 标准输出。"""
+    request_id = request_id or analysis.get("request_id") or new_request_id()
+
+    if not isinstance(products, list) or not products:
+        return _err_envelope(request_id, ERR_REC_INVALID_INPUT, "产品数据库为空")
+
+    if analysis.get("status") != STATUS_SUCCESS:
+        return _err_envelope(request_id, ERR_REC_INVALID_INPUT,
+                             "肌肤分析未成功，不进行推荐")
+
+    profile = _build_profile(analysis, preferences or {})
+
+    # 硬过滤 + 评分
+    scored: list[tuple[float, dict, dict]] = []
+    by_step: dict[str, list[dict]] = {}
+    for p in products:
+        if not _passes_hard_filters(p, profile):
+            continue
+        bucket = _step_bucket(p)
+        if not bucket:
+            continue
+        sc = _calculate_score(p, profile)
+        scored.append((sc["match_score"], p, sc))
+        enriched = {**p, "_step_bucket": bucket, "_score": sc}
+        by_step.setdefault(bucket, []).append(enriched)
+
+    if not scored:
+        return _err_envelope(request_id, ERR_REC_NO_MATCH,
+                             "未找到匹配产品，可放宽预算或减少限制后重试",
+                             profile=profile)
+
+    for step in by_step:
+        by_step[step].sort(key=lambda x: x["_score"]["match_score"], reverse=True)
+
+    picked, fallback = _budget_adjust(by_step, profile)
+
+    if not picked:
+        return _err_envelope(request_id, ERR_REC_BUDGET_TOO_LOW,
+                             "预算过低，无法组成方案", profile=profile,
+                             fallback=fallback)
+
+    recommendations = []
+    for p in picked:
+        sc = p["_score"]
+        reason = _generate_reason(p, sc, profile)
+        warnings = list(p["contraindications"])
+        if profile["sensitive"] and "首次使用建议进行局部耐受测试" not in warnings:
+            warnings.append("首次使用建议进行局部耐受测试")
+        recommendations.append({
+            "product_id": p["product_id"],
+            "name": p["name"],
+            "brand": p["brand"],
+            "category": p["category"],
+            "usage_step": p["usage_step"],
+            "price": p["price"],
+            "volume": p["volume"],
+            "rating": p["rating"],
+            "match_score": sc["match_score"],
+            "score_breakdown": sc["score_breakdown"],
+            "matched_concerns": sc["matched_concerns"],
+            "key_ingredients": p["key_ingredients"],
+            "reason": reason,
+            "usage_time": p["usage_time"],
+            "warnings": warnings,
+        })
+
+    morning, evening = _build_routines(picked)
+    total_price = round(sum(p["price"] for p in picked), 2)
+
+    global_warnings = list(_detect_conflicts(picked))
+    if profile["sensitive"]:
+        global_warnings.extend(SENSITIVE_TIPS)
+
+    status = STATUS_PARTIAL if fallback["applied"] else STATUS_SUCCESS
+    env = std_envelope(request_id, status, error=None)
+    env.update({
+        "profile_summary": {
+            "base_skin_type": profile["base_skin_type"],
+            "skin_type_source": profile["skin_type_source"],
+            "skin_tags": profile["skin_tags"],
+            "primary_concerns": profile["primary_concerns"],
+            "budget_total": profile["budget_total"],
+        },
+        "recommendations": recommendations,
+        "routine": {"morning": morning, "evening": evening},
+        "total_price": total_price,
+        "global_warnings": global_warnings,
+        "fallback": fallback,
+    })
+    return env
+
+
+def _err_envelope(request_id: str, code: str, message: str,
+                  profile: dict | None = None,
+                  fallback: dict | None = None) -> dict:
+    env = std_envelope(request_id, "partial" if code == ERR_REC_BUDGET_TOO_LOW else "error",
+                       error={"code": code, "message": message})
+    env.update({
+        "profile_summary": {
+            "base_skin_type": (profile or {}).get("base_skin_type", "不确定"),
+            "skin_type_source": (profile or {}).get("skin_type_source", "model"),
+            "skin_tags": (profile or {}).get("skin_tags", []),
+            "primary_concerns": (profile or {}).get("primary_concerns", []),
+            "budget_total": (profile or {}).get("budget_total", 0),
+        },
+        "recommendations": [],
+        "routine": {"morning": [], "evening": []},
+        "total_price": 0.0,
+        "global_warnings": [],
+        "fallback": fallback or {"applied": True, "reason": message},
+    })
+    return env
