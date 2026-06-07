@@ -1,8 +1,9 @@
-"""Qwen2.5-VL 视觉分析：把面部照片转成结构化肌肤报告。
+"""Qwen3-VL 视觉分析：把面部照片转成结构化肌肤报告。
 
 环境变量：
-    MODELSCOPE_API_KEY  必填，魔搭个人访问令牌
-    MODELSCOPE_MODEL    可选，默认 Qwen/Qwen2.5-VL-72B-Instruct
+    MS_API_KEY         必填，魔搭个人访问令牌（部署在魔搭 Studio 用这个名）
+    MODELSCOPE_API_KEY 兼容，本地开发也可用此名
+    MS_MODEL           可选，默认 Qwen/Qwen3-VL-30B-A3B-Instruct
 """
 import os
 import json
@@ -57,11 +58,15 @@ def _extract_json(text: str) -> dict:
 
 
 def analyze_skin(image_data_url: str) -> dict:
-    api_key = os.environ.get("MODELSCOPE_API_KEY", "").strip()
+    api_key = (
+        os.environ.get("MS_API_KEY")
+        or os.environ.get("MODELSCOPE_API_KEY")
+        or ""
+    ).strip()
     if not api_key:
-        raise AnalyzeError("未配置 MODELSCOPE_API_KEY 环境变量")
+        raise AnalyzeError("未配置 MS_API_KEY 环境变量")
 
-    model = os.environ.get("MODELSCOPE_MODEL", DEFAULT_MODEL)
+    model = os.environ.get("MS_MODEL") or os.environ.get("MODELSCOPE_MODEL") or DEFAULT_MODEL
     payload = {
         "model": model,
         "messages": [
