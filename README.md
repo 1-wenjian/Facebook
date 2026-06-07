@@ -15,7 +15,7 @@ AI 创业营编程挑战赛参赛作品。上传面部照片，多模态大模�
 
 ```bash
 pip install -r requirements.txt
-export MS_API_KEY=<你的魔搭访问令牌>   # 部署在魔搭 Studio 时也用这个名
+export SKIN_API_KEY=<你的魔搭访问令牌>   # 部署在魔搭 Studio 时也用这个名
 python app.py
 ```
 
