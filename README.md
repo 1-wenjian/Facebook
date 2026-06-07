@@ -1,10 +1,24 @@
+---
+# 详细文档见 https://modelscope.cn/docs/%E5%88%9B%E7%A9%BA%E9%97%B4%E5%8D%A1%E7%89%87
+domain: #领域：cv/nlp/audio/multi-modal/AutoML
+- multi-modal
+tags:
+- skincare
+- vision-language
+- recommendation
+license: Apache License 2.0
+## 启动文件(若SDK为Gradio/Streamlit，默认为app.py)
+# deployspec:
+#   entry_file: app.py
+---
+
 # 🪞 肌肤分析与护肤产品推荐助手
 
 AI 创业营编程挑战赛参赛作品。上传面部照片，多模态大模型识别可见肌肤状态（痘痘、毛孔、暗沉、干燥、屏障受损等），并从京东 297 款护肤品中拼一套早晚护肤流程，给出推荐理由与成分搭配提示。
 
 ## ✨ 功能
 
-- **肌肤图片分析**：调用魔搭 ModelScope 的 Qwen2.5-VL 输出结构化 JSON 报告（肤质、可见问题、严重度、区域）
+- **肌肤图片分析**：调用魔搭 ModelScope 的 Qwen3-VL 输出结构化 JSON 报告（肤质、可见问题、严重度、区域）
 - **个性化推荐**：按问题 × 肤质 × 预算 × 过敏成分四维度做规则匹配，附推荐理由
 - **早晚护肤流程**：洁面 → 水 → 精华 → 乳/霜 → 眼霜 / 防晒 自动拼装
 - **成分冲突检测**：视黄醇 × 酸类、VC × 烟酰胺 等常见搭配提示
@@ -27,14 +41,14 @@ python app.py
 ┌──────────────────────────────────────────────┐
 │  app.py    Gradio UI + 流程编排              │
 ├──────────────────────────────────────────────┤
-│  analyzer.py     Qwen2.5-VL 调用 + JSON 解析 │
+│  analyzer.py     Qwen3-VL 调用 + JSON 解析   │
 │  recommender.py  规则匹配 + 早晚流程 + 冲突   │
 │  products.json   京东护肤品数据库（297 条）   │
 └──────────────────────────────────────────────┘
 ```
 
-- **前端**：Gradio 4.x，Blocks 多 Tab 分区（报告 / 产品 / 流程 / 成分）
-- **视觉模型**：Qwen2.5-VL-72B-Instruct（魔搭 API Inference，OpenAI 兼容协议）
+- **前端**：Gradio Blocks 多 Tab 分区（报告 / 产品 / 流程 / 成分）
+- **视觉模型**：Qwen3-VL-30B-A3B-Instruct（魔搭 API Inference，OpenAI 兼容协议）
 - **推荐**：规则评分（命中 concern + 肤质适配 + 评分加权 - 超预算惩罚 - 过敏过滤）
 
 ## 📝 评分维度对齐
